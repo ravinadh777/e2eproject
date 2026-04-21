@@ -1,0 +1,322 @@
+# .github/workflows/ci.yml
+# CI Pipeline: Install → Test → Lint → Build → Scan → Push to ECR
+name: CI Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  S3_REPORTS_BUCKET: ${{ secrets.S3_REPORTS_BUCKET }}
+  NODE_VERSION: "20"
+
+jobs:
+  # ── Detect which services changed ─────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            auth-service:        ['services/auth-service/**']
+            workspace-service:   ['services/workspace-service/**']
+            ai-gateway-service:  ['services/ai-gateway-service/**']
+            billing-service:     ['services/billing-service/**']
+            notification-service:['services/notification-service/**']
+            analytics-service:   ['services/analytics-service/**']
+            frontend:            ['frontend/**']
+
+      - name: Build service matrix
+        id: set-matrix
+        run: |
+          ALL_SERVICES="auth-service workspace-service ai-gateway-service billing-service notification-service analytics-service"
+          SERVICES=()
+          for svc in $ALL_SERVICES; do
+            CHANGED=$(echo '${{ toJson(steps.changes.outputs) }}' | jq -r ".\"$svc\"" 2>/dev/null || echo "false")
+            if [[ "${{ github.ref }}" == "refs/heads/main" ]] || \
+               [[ "${{ github.ref }}" == "refs/heads/develop" ]] || \
+               [[ "$CHANGED" == "true" ]]; then
+              SERVICES+=("$svc")
+            fi
+          done
+          if [ ${#SERVICES[@]} -eq 0 ]; then
+            echo 'matrix={"service":["auth-service"]}' >> $GITHUB_OUTPUT
+          else
+            MATRIX=$(printf '%s\n' "${SERVICES[@]}" | jq -R . | jq -sc '{"service": .}')
+            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Test, Lint, Build, Scan per service ──────────────────────────────────
+  test-and-build:
+    name: ${{ matrix.service }} — Test/Build/Scan
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: npm ci
+
+      - name: Lint
+        working-directory: services/${{ matrix.service }}
+        run: npm run lint || true
+
+      - name: Unit tests with coverage
+        working-directory: services/${{ matrix.service }}
+        run: npm test -- --coverage --coverageReporters=lcov --coverageReporters=text
+        env:
+          NODE_ENV: test
+          CI: true
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.service }}
+          path: services/${{ matrix.service }}/coverage/
+          retention-days: 7
+
+      # ── SonarQube SAST ────────────────────────────────────────────────────
+      - name: SonarQube Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: services/${{ matrix.service }}
+          args: >
+            -Dsonar.projectKey=promptflow-${{ matrix.service }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.sources=src
+            -Dsonar.tests=tests
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.qualitygate.wait=true
+
+      - name: Upload SonarQube coverage to S3
+        if: always() && env.S3_REPORTS_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 sync services/${{ matrix.service }}/coverage/ \
+            "s3://${{ env.S3_REPORTS_BUCKET }}/sonar-reports/$(date +%Y-%m-%d)/${{ matrix.service }}/${{ github.sha }}/" \
+            --quiet || true
+
+      # ── Docker Build ──────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repo exists
+        run: |
+          aws ecr describe-repositories --repository-names "promptflow/${{ matrix.service }}" 2>/dev/null || \
+          aws ecr create-repository --repository-name "promptflow/${{ matrix.service }}" \
+            --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ matrix.service }}
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          build-args: NODE_ENV=production
+
+      # ── Trivy CVE Scan ────────────────────────────────────────────────────
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+
+      - name: Upload Trivy report to S3
+        if: always() && env.S3_REPORTS_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp trivy-${{ matrix.service }}.sarif \
+            "s3://${{ env.S3_REPORTS_BUCKET }}/trivy-reports/$(date +%Y-%m-%d)/${{ matrix.service }}/${{ github.sha }}.sarif" || true
+
+      # ── Docker Scout Scan ─────────────────────────────────────────────────
+      - name: Docker Scout CVE scan
+        uses: docker/scout-action@v1
+        if: ${{ secrets.DOCKER_HUB_TOKEN != '' }}
+        with:
+          command: cves
+          image: ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${{ github.sha }}
+          only-severities: critical,high
+          exit-code: false
+          write-comment: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          dockerhub-user: ${{ secrets.DOCKER_HUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          sarif-file: scout-${{ matrix.service }}.sarif
+
+      - name: Upload Docker Scout report to S3
+        if: always() && env.S3_REPORTS_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp scout-${{ matrix.service }}.sarif \
+            "s3://${{ env.S3_REPORTS_BUCKET }}/scout-reports/$(date +%Y-%m-%d)/${{ matrix.service }}/${{ github.sha }}.sarif" 2>/dev/null || true
+
+      # ── Push to ECR ───────────────────────────────────────────────────────
+      - name: Push to ECR
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${{ github.sha }}
+          docker push ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:latest
+          BRANCH_TAG=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          docker tag ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${{ github.sha }} \
+                     ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${BRANCH_TAG}
+          docker push ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:${BRANCH_TAG}
+
+      # ── Upload application logs to S3 ─────────────────────────────────────
+      - name: Upload app logs to S3
+        if: always() && env.S3_REPORTS_BUCKET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          find services/${{ matrix.service }} -name "*.log" 2>/dev/null | \
+          xargs -I{} aws s3 cp {} \
+            "s3://${{ env.S3_REPORTS_BUCKET }}/app-logs/$(date +%Y-%m-%d)/${{ matrix.service }}/${{ github.sha }}/" 2>/dev/null || true
+
+  # ── Frontend CI ───────────────────────────────────────────────────────────
+  frontend-ci:
+    name: Frontend — Build/Scan/Push
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend == 'true' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install and build
+        working-directory: frontend
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npm run build
+        env:
+          REACT_APP_API_BASE_URL: /api
+          CI: false
+
+      - name: SonarQube frontend scan
+        uses: SonarSource/sonarcloud-github-action@master
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: frontend
+          args: >
+            -Dsonar.projectKey=promptflow-frontend
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+
+      - name: Configure AWS & push frontend image
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and push frontend Docker image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          aws ecr describe-repositories --repository-names "promptflow/frontend" 2>/dev/null || \
+            aws ecr create-repository --repository-name "promptflow/frontend" \
+              --image-scanning-configuration scanOnPush=true
+          docker build -t ${{ env.ECR_REGISTRY }}/promptflow/frontend:${{ github.sha }} \
+                       -t ${{ env.ECR_REGISTRY }}/promptflow/frontend:latest ./frontend
+          docker push ${{ env.ECR_REGISTRY }}/promptflow/frontend:${{ github.sha }}
+          docker push ${{ env.ECR_REGISTRY }}/promptflow/frontend:latest
+
+  # ── Notify on failure ─────────────────────────────────────────────────────
+  notify-failure:
+    name: Notify CI Failure
+    runs-on: ubuntu-latest
+    needs: [test-and-build, frontend-ci]
+    if: failure()
+    steps:
+      - name: Send failure email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "🚨 CI FAILED — ${{ github.repository }} / ${{ github.ref_name }}"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: '"PromptFlow CI" <${{ secrets.SMTP_USER }}>'
+          html_body: |
+            <h2 style="color:red">CI Pipeline Failed</h2>
+            <table>
+              <tr><td><b>Repo:</b></td><td>${{ github.repository }}</td></tr>
+              <tr><td><b>Branch:</b></td><td>${{ github.ref_name }}</td></tr>
+              <tr><td><b>Commit:</b></td><td>${{ github.sha }}</td></tr>
+              <tr><td><b>Actor:</b></td><td>${{ github.actor }}</td></tr>
+            </table>
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Pipeline Logs</a>

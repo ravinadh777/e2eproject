@@ -1,0 +1,145 @@
+# monitoring/prometheus/alert-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: promptflow-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # ── Service Availability ────────────────────────────────────────────────
+    - name: service-availability
+      interval: 30s
+      rules:
+        - alert: ServiceDown
+          expr: up{job="promptflow-services"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Service {{ $labels.service }} is DOWN"
+            description: "Service {{ $labels.service }} in namespace {{ $labels.namespace }} has been down for more than 1 minute."
+
+        - alert: HighErrorRate
+          expr: |
+            rate(auth_http_requests_total{status_code=~"5.."}[5m]) /
+            rate(auth_http_requests_total[5m]) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High error rate on {{ $labels.service }}"
+            description: "Error rate is {{ $value | humanizePercentage }} for service {{ $labels.service }}"
+
+        - alert: PodRestartingFrequently
+          expr: rate(kube_pod_container_status_restarts_total{namespace="promptflow"}[15m]) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.pod }} is restarting frequently"
+            description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes."
+
+    # ── AI Gateway Specific ─────────────────────────────────────────────────
+    - name: ai-gateway
+      rules:
+        - alert: AIRequestLatencyHigh
+          expr: histogram_quantile(0.95, rate(ai_request_duration_seconds_bucket[5m])) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "AI request P95 latency is {{ $value }}s"
+            description: "AI gateway P95 latency has exceeded 10 seconds. Users may be experiencing slow responses."
+
+        - alert: AIRequestRateDrop
+          expr: rate(ai_gateway_http_duration_seconds_count[5m]) < 0.01
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "AI request rate has dropped significantly"
+            description: "Very few AI requests are being processed. Service may be degraded."
+
+    # ── Resource Usage ──────────────────────────────────────────────────────
+    - name: resource-usage
+      rules:
+        - alert: HighCPUUsage
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{namespace="promptflow", container!=""}[5m])) by (pod, container)
+            / sum(kube_pod_container_resource_limits{namespace="promptflow", resource="cpu"}) by (pod, container)
+            > 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High CPU usage in pod {{ $labels.pod }}"
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of CPU limit."
+
+        - alert: HighMemoryUsage
+          expr: |
+            sum(container_memory_working_set_bytes{namespace="promptflow", container!=""}) by (pod, container)
+            / sum(kube_pod_container_resource_limits{namespace="promptflow", resource="memory"}) by (pod, container)
+            > 0.90
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Memory usage critical in {{ $labels.pod }}"
+            description: "Container {{ $labels.container }} is using {{ $value | humanizePercentage }} of memory limit. OOMKill risk!"
+
+        - alert: DiskSpaceLow
+          expr: |
+            (kubelet_volume_stats_available_bytes{namespace="promptflow"}
+            / kubelet_volume_stats_capacity_bytes{namespace="promptflow"}) < 0.15
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PVC {{ $labels.persistentvolumeclaim }} disk space low"
+            description: "Only {{ $value | humanizePercentage }} disk space remaining on PVC {{ $labels.persistentvolumeclaim }}"
+
+    # ── PostgreSQL StatefulSet ──────────────────────────────────────────────
+    - name: postgresql
+      rules:
+        - alert: PostgreSQLDown
+          expr: up{job=~".*postgresql.*"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgreSQL is DOWN"
+            description: "PostgreSQL database is unreachable. All services will be affected."
+
+        - alert: PostgreSQLHighConnections
+          expr: pg_stat_activity_count > 80
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PostgreSQL connection count is high: {{ $value }}"
+
+    # ── Ingress ─────────────────────────────────────────────────────────────
+    - name: ingress
+      rules:
+        - alert: IngressHighLatency
+          expr: |
+            histogram_quantile(0.99,
+              rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])
+            ) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ingress P99 latency is {{ $value }}s"
+
+        - alert: IngressHighErrorRate
+          expr: |
+            sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+            / sum(rate(nginx_ingress_controller_requests[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Ingress error rate is {{ $value | humanizePercentage }}"

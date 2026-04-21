@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ai-gateway-service
+description: PromptFlow ai-gateway-service Helm Chart
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

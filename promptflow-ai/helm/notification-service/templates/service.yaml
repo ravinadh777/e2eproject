@@ -1,0 +1,17 @@
+{{/* helm/notification-service/templates/service.yaml */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "notification-service.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "notification-service.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "notification-service.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,36 @@
+{{/* helm/postgresql/templates/service.yaml */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgresql
+    app.kubernetes.io/part-of: promptflow
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: 5432
+      protocol: TCP
+      name: postgresql
+  selector:
+    app: postgresql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgresql
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+      name: postgresql
+  selector:
+    app: postgresql

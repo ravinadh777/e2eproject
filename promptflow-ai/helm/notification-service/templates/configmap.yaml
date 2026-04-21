@@ -1,0 +1,21 @@
+{{/* helm/notification-service/templates/configmap.yaml */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "notification-service.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "notification-service.labels" . | nindent 4 }}
+data:
+  NODE_ENV: {{ .Values.env.NODE_ENV | quote }}
+  PORT: {{ .Values.env.PORT | quote }}
+  LOG_LEVEL: {{ .Values.env.LOG_LEVEL | quote }}
+  DB_HOST: {{ .Values.env.DB_HOST | quote }}
+  DB_PORT: {{ .Values.env.DB_PORT | quote }}
+  DB_NAME: {{ .Values.env.DB_NAME | quote }}
+  DB_USER: {{ .Values.env.DB_USER | quote }}
+  REDIS_HOST: {{ .Values.env.REDIS_HOST | quote }}
+  REDIS_PORT: {{ .Values.env.REDIS_PORT | quote }}
+  JWT_EXPIRES_IN: {{ .Values.env.JWT_EXPIRES_IN | quote }}
+  REFRESH_TOKEN_EXPIRES: {{ .Values.env.REFRESH_TOKEN_EXPIRES | quote }}
+  CORS_ORIGIN: {{ .Values.env.CORS_ORIGIN | quote }}

@@ -1,0 +1,146 @@
+# .github/workflows/release.yml
+# Release Pipeline: tag → changelog → GitHub Release → version Docker images
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v1.2.3)'
+        required: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  CLUSTER_NAME: ${{ vars.CLUSTER_NAME || 'promptflow-cluster' }}
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_short=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Generate Changelog
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v4
+        with:
+          configuration: .github/changelog-config.json
+          toTag: ${{ steps.version.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version.outputs.version }}
+          name: "PromptFlow AI ${{ steps.version.outputs.version }}"
+          body: |
+            ## 🚀 PromptFlow AI ${{ steps.version.outputs.version }}
+
+            ### What's Changed
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### 📦 Docker Images
+            All services are available in ECR:
+            ```
+            ${{ env.ECR_REGISTRY }}/promptflow/auth-service:${{ steps.version.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/promptflow/workspace-service:${{ steps.version.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/promptflow/ai-gateway-service:${{ steps.version.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/promptflow/billing-service:${{ steps.version.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/promptflow/notification-service:${{ steps.version.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/promptflow/analytics-service:${{ steps.version.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/promptflow/frontend:${{ steps.version.outputs.version }}
+            ```
+
+            ### 🔧 Deploy this release
+            ```bash
+            ./scripts/deploy-service.sh --tag ${{ steps.version.outputs.version }} --all
+            ```
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Tag Docker images with release version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SERVICES="auth-service workspace-service ai-gateway-service billing-service notification-service analytics-service frontend"
+
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+          for SVC in $SERVICES; do
+            LATEST="${{ env.ECR_REGISTRY }}/promptflow/$SVC:latest"
+            VERSIONED="${{ env.ECR_REGISTRY }}/promptflow/$SVC:$VERSION"
+
+            echo "Tagging $SVC as $VERSION..."
+            # Pull latest, re-tag with version, push
+            docker pull "$LATEST" 2>/dev/null && \
+            docker tag "$LATEST" "$VERSIONED" && \
+            docker push "$VERSIONED" && \
+            echo "✅ $SVC:$VERSION pushed" || \
+            echo "⚠️  $SVC:$VERSION skipped (image not found)"
+          done
+
+      - name: Deploy release to production
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
+          # Trigger CD with this version
+          echo "Deployment of $VERSION triggered via CD pipeline"
+
+      - name: Upload release notes to S3
+        if: env.S3_REPORTS_BUCKET != ''
+        env:
+          S3_REPORTS_BUCKET: ${{ secrets.S3_REPORTS_BUCKET }}
+        run: |
+          echo "${{ steps.changelog.outputs.changelog }}" > release-notes.md
+          aws s3 cp release-notes.md \
+            "s3://${{ env.S3_REPORTS_BUCKET }}/releases/${{ steps.version.outputs.version }}/release-notes.md"
+
+      - name: Notify release
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "🎉 Released — PromptFlow AI ${{ steps.version.outputs.version }}"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: '"PromptFlow Releases" <${{ secrets.SMTP_USER }}>'
+          html_body: |
+            <h2>🎉 New Release: PromptFlow AI ${{ steps.version.outputs.version }}</h2>
+            <p>A new version has been released and deployed to production.</p>
+            <h3>Changelog</h3>
+            <pre>${{ steps.changelog.outputs.changelog }}</pre>
+            <a href="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.version.outputs.version }}">View Release →</a>

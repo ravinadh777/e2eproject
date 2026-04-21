@@ -1,0 +1,159 @@
+# .github/workflows/cd.yml
+# CD Pipeline: Deploy changed services to EKS with Helm + rollback on failure
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy (all if empty)'
+        required: false
+        default: ''
+      image_tag:
+        description: 'Docker image tag'
+        required: false
+        default: latest
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  CLUSTER_NAME: ${{ vars.CLUSTER_NAME || 'promptflow-cluster' }}
+  NAMESPACE: promptflow
+
+jobs:
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.14.0
+
+      - name: Get ingress hostname
+        id: ingress
+        run: |
+          HOST=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || \
+                 kubectl get svc ingress-nginx-controller -n ingress-nginx \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "localhost")
+          echo "host=$HOST" >> $GITHUB_OUTPUT
+
+      - name: Set deploy list and image tag
+        id: config
+        run: |
+          TAG="${{ github.event.inputs.image_tag || github.event.workflow_run.head_sha || github.sha }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          if [[ -n "${{ github.event.inputs.service }}" ]]; then
+            echo "services=${{ github.event.inputs.service }}" >> $GITHUB_OUTPUT
+          else
+            echo "services=auth-service workspace-service ai-gateway-service billing-service notification-service analytics-service frontend" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Helm deploy all services
+        id: deploy
+        run: |
+          declare -A PORTS=(
+            [auth-service]=3001 [workspace-service]=3002 [ai-gateway-service]=3003
+            [billing-service]=3004 [notification-service]=3005 [analytics-service]=3006 [frontend]=3000
+          )
+          FAILED=()
+          for SVC in ${{ steps.config.outputs.services }}; do
+            PORT=${PORTS[$SVC]:-3000}
+            echo "▶ Deploying $SVC (port $PORT, tag ${{ steps.config.outputs.tag }})"
+
+            # Capture current revision for rollback
+            OLD_REV=$(helm history "$SVC" -n ${{ env.NAMESPACE }} --max 1 --output json 2>/dev/null | \
+                      jq -r '.[0].revision' 2>/dev/null || echo "0")
+
+            if helm upgrade --install "$SVC" "./helm/$SVC" \
+              --namespace ${{ env.NAMESPACE }} \
+              --set image.repository="${{ env.ECR_REGISTRY }}/promptflow/$SVC" \
+              --set image.tag="${{ steps.config.outputs.tag }}" \
+              --set image.pullPolicy=Always \
+              --set service.port="$PORT" \
+              --set ingress.host="${{ steps.ingress.outputs.host }}" \
+              --set env.DB_HOST="postgresql.${{ env.NAMESPACE }}.svc.cluster.local" \
+              --set env.REDIS_HOST="redis-master.${{ env.NAMESPACE }}.svc.cluster.local" \
+              --set env.NODE_ENV=production \
+              --set env.AWS_REGION="${{ env.AWS_REGION }}" \
+              --set "podAnnotations.deploy\\.ts=$(date -u +%s)" \
+              --wait --timeout 5m --atomic; then
+              echo "✅ $SVC deployed"
+            else
+              echo "❌ $SVC FAILED — rolling back to revision $OLD_REV"
+              FAILED+=("$SVC")
+              [[ "$OLD_REV" != "0" ]] && helm rollback "$SVC" "$OLD_REV" -n ${{ env.NAMESPACE }} --wait || true
+            fi
+          done
+
+          echo "failed_services=${FAILED[*]}" >> $GITHUB_ENV
+          [[ ${#FAILED[@]} -gt 0 ]] && exit 1 || echo "All deployments succeeded"
+
+      - name: Post-deploy health check
+        if: success()
+        run: |
+          sleep 20
+          HOST="${{ steps.ingress.outputs.host }}"
+          for EP in /api/auth/health /api/workspace/health /api/ai/health /api/billing/health /api/notify/health /api/analytics/health; do
+            CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 "http://$HOST$EP" || echo 000)
+            echo "$EP → $CODE"
+          done
+          kubectl get pods -n ${{ env.NAMESPACE }} -o wide
+
+      - name: Notify success
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "✅ DEPLOYED — PromptFlow AI (${{ steps.config.outputs.tag }})"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: '"PromptFlow CD" <${{ secrets.SMTP_USER }}>'
+          html_body: |
+            <h2 style="color:green">✅ Deployment Successful</h2>
+            <p><b>Services:</b> ${{ steps.config.outputs.services }}</p>
+            <p><b>Tag:</b> ${{ steps.config.outputs.tag }}</p>
+            <p><b>URL:</b> http://${{ steps.ingress.outputs.host }}</p>
+            <p><b>Actor:</b> ${{ github.actor }}</p>
+
+      - name: Notify failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "🚨 DEPLOY FAILED — PromptFlow AI (${{ github.ref_name }})"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: '"PromptFlow CD" <${{ secrets.SMTP_USER }}>'
+          html_body: |
+            <h2 style="color:red">🚨 Deployment Failed</h2>
+            <p><b>Failed:</b> ${{ env.failed_services }}</p>
+            <p>Automatic rollback was attempted.</p>
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Logs →</a>

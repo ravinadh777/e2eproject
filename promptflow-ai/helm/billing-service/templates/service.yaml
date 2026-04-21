@@ -1,0 +1,17 @@
+{{/* helm/billing-service/templates/service.yaml */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "billing-service.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "billing-service.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "billing-service.selectorLabels" . | nindent 4 }}

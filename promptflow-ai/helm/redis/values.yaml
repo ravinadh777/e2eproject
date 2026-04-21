@@ -1,0 +1,20 @@
+image:
+  repository: redis
+  tag: "7-alpine"
+auth:
+  password: ""
+master:
+  persistence:
+    enabled: true
+    storageClass: gp2
+    size: 5Gi
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 50m
+    limits:
+      memory: 256Mi
+      cpu: 200m
+service:
+  type: ClusterIP
+  port: 6379

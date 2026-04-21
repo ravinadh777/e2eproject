@@ -1,0 +1,55 @@
+# helm/postgresql/values.yaml
+image:
+  repository: postgres
+  tag: "15-alpine"
+  pullPolicy: IfNotPresent
+
+auth:
+  username: promptflow
+  database: promptflow
+  existingSecret: db-credentials   # k8s secret with DB_PASSWORD key
+  secretKey: DB_PASSWORD
+
+primary:
+  persistence:
+    enabled: true
+    storageClass: gp2              # AWS EBS gp2
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
+  configuration: |
+    max_connections = 100
+    shared_buffers = 128MB
+    effective_cache_size = 256MB
+    maintenance_work_mem = 64MB
+    checkpoint_completion_target = 0.9
+    wal_buffers = 16MB
+    default_statistics_target = 100
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    log_min_duration_statement = 1000
+    log_connections = on
+    log_disconnections = on
+    log_line_prefix = '%t [%p]: user=%u,db=%d,app=%a,client=%h '
+
+service:
+  type: ClusterIP
+  port: 5432
+
+metrics:
+  enabled: true
+  image:
+    repository: prometheuscommunity/postgres-exporter
+    tag: latest
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9187"

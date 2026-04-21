@@ -1,0 +1,11 @@
+{{/* helm/postgresql/templates/configmap.yaml */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgresql-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgresql
+data:
+  postgresql.conf: |
+    {{ .Values.primary.configuration | nindent 4 }}

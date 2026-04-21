@@ -1,0 +1,78 @@
+# .github/workflows/security-scan.yml
+# Scheduled nightly security scan of all production images
+name: Security Scan (Scheduled)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # Every night at 2am UTC
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  S3_REPORTS_BUCKET: ${{ secrets.S3_REPORTS_BUCKET }}
+
+jobs:
+  security-scan:
+    name: Nightly Security Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth-service, workspace-service, ai-gateway-service, billing-service, notification-service, analytics-service, frontend]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Pull production image
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          docker pull ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:latest || \
+          echo "Image not found, skipping"
+
+      - name: Trivy full scan (all severities)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/promptflow/${{ matrix.service }}:latest
+          format: sarif
+          output: trivy-nightly-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "0"
+
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp trivy-nightly-${{ matrix.service }}.sarif \
+            "s3://${{ env.S3_REPORTS_BUCKET }}/nightly-scans/$(date +%Y-%m-%d)/${{ matrix.service }}.sarif" || true
+
+  notify-vulnerabilities:
+    name: Notify Vulnerability Report
+    needs: security-scan
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send nightly scan summary
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "🔒 Nightly Security Scan — PromptFlow AI ($(date +%Y-%m-%d))"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: '"PromptFlow Security" <${{ secrets.SMTP_USER }}>'
+          html_body: |
+            <h2>Nightly Security Scan Complete</h2>
+            <p>Date: $(date +%Y-%m-%d)</p>
+            <p>Reports uploaded to S3: ${{ secrets.S3_REPORTS_BUCKET }}/nightly-scans/</p>
+            <p>Status: ${{ needs.security-scan.result }}</p>
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Scan Results →</a>
